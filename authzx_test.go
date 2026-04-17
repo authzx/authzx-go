@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -191,5 +193,254 @@ func TestSubject_TypeOptional(t *testing.T) {
 	json.Unmarshal(data, &m)
 	if _, ok := m["type"]; ok {
 		t.Error("type should be omitted when empty")
+	}
+}
+
+// --- OAuth2 Client Credentials tests ---
+
+// oauthTestServers wires up a token endpoint and an API endpoint on separate
+// httptest.Servers so the two behaviors can be asserted independently.
+type oauthTestServers struct {
+	token   *httptest.Server
+	api     *httptest.Server
+	exchanges int32
+	apiCalls  int32
+}
+
+func (s *oauthTestServers) Close() {
+	s.token.Close()
+	s.api.Close()
+}
+
+func newOAuthTestServers(t *testing.T, tokenHandler http.HandlerFunc, apiHandler http.HandlerFunc) *oauthTestServers {
+	t.Helper()
+	s := &oauthTestServers{}
+	s.token = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&s.exchanges, 1)
+		tokenHandler(w, r)
+	}))
+	s.api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&s.apiCalls, 1)
+		apiHandler(w, r)
+	}))
+	return s
+}
+
+func TestOAuth_TokenExchangeHappyPath(t *testing.T) {
+	srv := newOAuthTestServers(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != "POST" {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+				t.Errorf("expected form content-type, got %s", got)
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("parse form: %v", err)
+			}
+			if r.Form.Get("grant_type") != "client_credentials" {
+				t.Errorf("expected grant_type=client_credentials, got %s", r.Form.Get("grant_type"))
+			}
+			if r.Form.Get("client_id") != "cid" || r.Form.Get("client_secret") != "azx_cs_secret" {
+				t.Errorf("unexpected creds in body: %v", r.Form)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"access_token": "jwt.token.here",
+				"token_type":   "Bearer",
+				"expires_in":   3600,
+			})
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Get("Authorization"); got != "Bearer jwt.token.here" {
+				t.Errorf("expected Bearer jwt.token.here, got %s", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(AuthorizeResponse{Allowed: true, Reason: "ok"})
+		},
+	)
+	defer srv.Close()
+
+	client := NewClient("",
+		WithBaseURL(srv.api.URL),
+		WithOAuth("cid", "azx_cs_secret"),
+		WithOAuthTokenURL(srv.token.URL),
+	)
+	allowed, err := client.Check(context.Background(), Subject{ID: "u-1"}, "read", Resource{ID: "d-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !allowed {
+		t.Error("expected allowed")
+	}
+	if got := atomic.LoadInt32(&srv.exchanges); got != 1 {
+		t.Errorf("expected 1 token exchange, got %d", got)
+	}
+}
+
+func TestOAuth_InvalidClientClearError(t *testing.T) {
+	srv := newOAuthTestServers(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			w.Write([]byte(`{"error":"invalid_client"}`))
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			t.Error("API should not be called when token exchange fails")
+		},
+	)
+	defer srv.Close()
+
+	client := NewClient("",
+		WithBaseURL(srv.api.URL),
+		WithOAuth("cid", "azx_cs_wrong"),
+		WithOAuthTokenURL(srv.token.URL),
+	)
+	_, err := client.Check(context.Background(), Subject{ID: "u-1"}, "read", Resource{ID: "d-1"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !IsOAuthError(err) {
+		t.Errorf("expected OAuthError, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "check client_id/client_secret") {
+		t.Errorf("expected setup-hint message, got %q", err.Error())
+	}
+}
+
+func TestOAuth_CachedTokenReusedAcrossCalls(t *testing.T) {
+	srv := newOAuthTestServers(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"access_token": "tok-abc",
+				"token_type":   "Bearer",
+				"expires_in":   3600,
+			})
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(AuthorizeResponse{Allowed: true, Reason: "ok"})
+		},
+	)
+	defer srv.Close()
+
+	client := NewClient("",
+		WithBaseURL(srv.api.URL),
+		WithOAuth("cid", "azx_cs_secret"),
+		WithOAuthTokenURL(srv.token.URL),
+	)
+
+	for i := 0; i < 3; i++ {
+		if _, err := client.Check(context.Background(), Subject{ID: "u-1"}, "read", Resource{ID: "d-1"}); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&srv.exchanges); got != 1 {
+		t.Errorf("expected 1 token exchange across 3 calls, got %d", got)
+	}
+	if got := atomic.LoadInt32(&srv.apiCalls); got != 3 {
+		t.Errorf("expected 3 API calls, got %d", got)
+	}
+}
+
+func TestOAuth_401TriggersRefreshAndRetry(t *testing.T) {
+	var tokenCounter int32
+	srv := newOAuthTestServers(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&tokenCounter, 1)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"access_token": "tok-" + string(rune('0'+n)),
+				"token_type":   "Bearer",
+				"expires_in":   3600,
+			})
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			auth := r.Header.Get("Authorization")
+			// First token rejected; second accepted.
+			if auth == "Bearer tok-1" {
+				w.WriteHeader(401)
+				w.Write([]byte("stale token"))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(AuthorizeResponse{Allowed: true, Reason: "ok"})
+		},
+	)
+	defer srv.Close()
+
+	client := NewClient("",
+		WithBaseURL(srv.api.URL),
+		WithOAuth("cid", "azx_cs_secret"),
+		WithOAuthTokenURL(srv.token.URL),
+	)
+	allowed, err := client.Check(context.Background(), Subject{ID: "u-1"}, "read", Resource{ID: "d-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !allowed {
+		t.Error("expected allowed after refresh+retry")
+	}
+	if got := atomic.LoadInt32(&srv.exchanges); got != 2 {
+		t.Errorf("expected 2 token exchanges (initial + refresh), got %d", got)
+	}
+	if got := atomic.LoadInt32(&srv.apiCalls); got != 2 {
+		t.Errorf("expected 2 API calls (401 + retry), got %d", got)
+	}
+}
+
+func TestOAuth_401RetryOnlyOnce(t *testing.T) {
+	srv := newOAuthTestServers(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"access_token": "tok",
+				"token_type":   "Bearer",
+				"expires_in":   3600,
+			})
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(401)
+			w.Write([]byte("nope"))
+		},
+	)
+	defer srv.Close()
+
+	client := NewClient("",
+		WithBaseURL(srv.api.URL),
+		WithOAuth("cid", "azx_cs_secret"),
+		WithOAuthTokenURL(srv.token.URL),
+	)
+	_, err := client.Check(context.Background(), Subject{ID: "u-1"}, "read", Resource{ID: "d-1"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !IsAuthError(err) {
+		t.Errorf("expected auth error after retry exhausted, got %v", err)
+	}
+	// Exactly two API calls: initial + one refresh-retry. No infinite loop.
+	if got := atomic.LoadInt32(&srv.apiCalls); got != 2 {
+		t.Errorf("expected 2 API calls, got %d", got)
+	}
+}
+
+func TestOAuth_ConstructionError_BothAuthModes(t *testing.T) {
+	// apiKey + OAuth is invalid. NewClient is lenient (keeps the existing
+	// public signature stable), so the error surfaces on the first call.
+	c := NewClient("azx_key", WithOAuth("cid", "azx_cs_secret"))
+	_, err := c.Authorize(context.Background(), &AuthorizeRequest{
+		Subject: Subject{ID: "u-1"}, Resource: Resource{ID: "d-1"}, Action: "read",
+	})
+	if err == nil {
+		t.Fatal("expected validation error when both apiKey and OAuth set")
+	}
+	if !strings.Contains(err.Error(), "either an API key or OAuth") {
+		t.Errorf("unexpected message: %q", err.Error())
+	}
+
+	// OAuth-only should construct cleanly via NewClientWithOptions.
+	if _, err := NewClientWithOptions(WithOAuth("cid", "azx_cs_secret")); err != nil {
+		t.Errorf("OAuth-only should construct cleanly: %v", err)
 	}
 }

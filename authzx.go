@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,8 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	maxRetries int
+
+	oauth *oauthConfig
 }
 
 // ClientOption configures the client.
@@ -43,9 +46,36 @@ func WithRetries(n int) ClientOption {
 	return func(c *Client) { c.maxRetries = n }
 }
 
+// WithOAuth configures OAuth2 Client Credentials authentication. The SDK will
+// exchange these credentials for a short-lived bearer token at
+// https://api.authzx.com/identity-srv/v1/oauth/token (or the URL set via
+// WithOAuthTokenURL), cache it in memory, and refresh it ~60s before expiry.
+// Mutually exclusive with providing an API key to NewClient.
+func WithOAuth(clientID, clientSecret string) ClientOption {
+	return func(c *Client) {
+		c.oauth = &oauthConfig{
+			clientID:     clientID,
+			clientSecret: clientSecret,
+			tokenURL:     defaultTokenURL,
+		}
+	}
+}
+
+// WithOAuthTokenURL overrides the OAuth2 token endpoint URL (useful for tests
+// and self-hosted AuthzX installations). Has no effect unless WithOAuth is
+// also supplied.
+func WithOAuthTokenURL(tokenURL string) ClientOption {
+	return func(c *Client) {
+		if c.oauth != nil {
+			c.oauth.tokenURL = tokenURL
+		}
+	}
+}
+
 // NewClient creates a new AuthzX client.
-// For cloud: authzx.NewClient("azx_...")
-// For local agent: authzx.NewClient("", authzx.WithBaseURL("http://localhost:8181"))
+// For cloud with API key: authzx.NewClient("azx_...")
+// For cloud with OAuth:   authzx.NewClient("", authzx.WithOAuth("client-id", "azx_cs_..."))
+// For local agent:        authzx.NewClient("", authzx.WithBaseURL("http://localhost:8181"))
 func NewClient(apiKey string, opts ...ClientOption) *Client {
 	c := &Client{
 		apiKey:     apiKey,
@@ -57,6 +87,30 @@ func NewClient(apiKey string, opts ...ClientOption) *Client {
 		opt(c)
 	}
 	return c
+}
+
+// NewClientWithOptions builds a client using only options (no positional API
+// key). It returns an error if the combination of auth options is invalid
+// (e.g. both apiKey and OAuth provided, or neither for a non-local base URL).
+//
+// Existing callers should continue using NewClient; this constructor is for
+// callers who want construction-time validation of their auth config.
+func NewClientWithOptions(opts ...ClientOption) (*Client, error) {
+	c := NewClient("", opts...)
+	if err := c.validateAuth(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// validateAuth enforces mutual exclusion between API key and OAuth creds.
+// An empty apiKey + no OAuth is allowed to preserve the existing "local
+// agent" usage pattern (NewClient("", WithBaseURL(...))).
+func (c *Client) validateAuth() error {
+	if c.apiKey != "" && c.oauth != nil {
+		return errors.New("authzx: configure either an API key or OAuth client credentials, not both")
+	}
+	return nil
 }
 
 // Check is a convenience method that returns just the boolean result.
@@ -79,12 +133,36 @@ func (c *Client) url() string {
 	return c.baseURL + "/v1/authorize"
 }
 
+// authHeader resolves the value for the Authorization header on API calls.
+// Returns "" if no auth is configured (local-agent mode).
+func (c *Client) authHeader(ctx context.Context) (string, error) {
+	if c.oauth != nil {
+		tok, err := c.oauth.getToken(ctx, c.httpClient)
+		if err != nil {
+			return "", err
+		}
+		return "Bearer " + tok, nil
+	}
+	if c.apiKey != "" {
+		return "Bearer " + c.apiKey, nil
+	}
+	return "", nil
+}
+
 // Authorize sends a full authorization request and returns the detailed response.
 func (c *Client) Authorize(ctx context.Context, req *AuthorizeRequest) (*AuthorizeResponse, error) {
+	if err := c.validateAuth(); err != nil {
+		return nil, err
+	}
+
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("authzx: failed to marshal request: %w", err)
 	}
+
+	// OAuth flow gets exactly one 401-triggered refresh+retry across the
+	// whole call, independent of maxRetries.
+	oauthRetried := false
 
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
@@ -97,8 +175,13 @@ func (c *Client) Authorize(ctx context.Context, req *AuthorizeRequest) (*Authori
 			return nil, fmt.Errorf("authzx: failed to create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		if c.apiKey != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+		authVal, err := c.authHeader(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if authVal != "" {
+			httpReq.Header.Set("Authorization", authVal)
 		}
 
 		resp, err := c.httpClient.Do(httpReq)
@@ -120,6 +203,15 @@ func (c *Client) Authorize(ctx context.Context, req *AuthorizeRequest) (*Authori
 				return nil, fmt.Errorf("authzx: failed to parse response: %w", err)
 			}
 			return &result, nil
+		}
+
+		// On 401 with OAuth, invalidate the cached token and retry once.
+		if resp.StatusCode == http.StatusUnauthorized && c.oauth != nil && !oauthRetried {
+			c.oauth.invalidate()
+			oauthRetried = true
+			// Do not count this against maxRetries.
+			attempt--
+			continue
 		}
 
 		apiErr := &Error{StatusCode: resp.StatusCode, Message: string(respBody)}

@@ -2,10 +2,12 @@
 
 Go client for [AuthzX](https://authzx.com) — works with both AuthzX Cloud and the local AuthzX Agent.
 
+Current release: **v0.2.0** (adds OAuth2 Client Credentials support).
+
 ## Install
 
 ```bash
-go get github.com/authzx/authzx-go
+go get github.com/authzx/authzx-go@v0.2.0
 ```
 
 ## Usage
@@ -35,6 +37,27 @@ func main() {
     fmt.Println("Allowed:", allowed)
 }
 ```
+
+### OAuth2 Client Credentials
+
+For service-to-service auth, use an OAuth2 client (`client_id` + `client_secret`, where the secret is prefixed `azx_cs_`). The SDK exchanges credentials at the token endpoint, caches the JWT in memory, and refreshes ~60s before expiry.
+
+```go
+client := authzx.NewClient("",
+    authzx.WithOAuth("my-client-id", "azx_cs_..."),
+)
+```
+
+Equivalent curl for the underlying token exchange:
+
+```bash
+curl -X POST https://api.authzx.com/identity-srv/v1/oauth/token \
+  -d grant_type=client_credentials \
+  -d client_id=my-client-id \
+  -d client_secret=azx_cs_...
+```
+
+Providing both an API key and `WithOAuth(...)` is rejected. A bad `client_id` / `client_secret` surfaces as a distinct `*authzx.OAuthError` (check with `authzx.IsOAuthError(err)`) with a message telling you to recheck your credentials.
 
 ### Agent Mode (local)
 

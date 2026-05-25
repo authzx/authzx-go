@@ -32,16 +32,18 @@ func TestCheck_Allowed(t *testing.T) {
 		if req.Subject.ID != "user-1" {
 			t.Errorf("expected subject ID user-1, got %s", req.Subject.ID)
 		}
-		if req.Action != "read" {
-			t.Errorf("expected action read, got %s", req.Action)
+		if req.Action.Name != "read" {
+			t.Errorf("expected action name read, got %s", req.Action.Name)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(AuthorizeResponse{
-			Allowed:    true,
-			Reason:     "role_match",
-			PolicyID:   "pol-1",
-			AccessPath: "role",
+			Decision: true,
+			Context: &AuthorizeContext{
+				Reason:   "role_match",
+				PolicyID: "pol-1",
+				AccessPath: "role",
+			},
 		})
 	})
 	defer srv.Close()
@@ -63,7 +65,10 @@ func TestCheck_Allowed(t *testing.T) {
 func TestCheck_Denied(t *testing.T) {
 	srv := mockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(AuthorizeResponse{Allowed: false, Reason: "no matching policy"})
+		json.NewEncoder(w).Encode(AuthorizeResponse{
+			Decision: false,
+			Context:  &AuthorizeContext{Reason: "no matching policy"},
+		})
 	})
 	defer srv.Close()
 
@@ -83,10 +88,12 @@ func TestAuthorize_FullResponse(t *testing.T) {
 	srv := mockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(AuthorizeResponse{
-			Allowed:    true,
-			Reason:     "direct_access",
-			PolicyID:   "pol-123",
-			AccessPath: "direct",
+			Decision: true,
+			Context: &AuthorizeContext{
+				Reason:     "direct_access",
+				PolicyID:   "pol-123",
+				AccessPath: "direct",
+			},
 		})
 	})
 	defer srv.Close()
@@ -95,19 +102,22 @@ func TestAuthorize_FullResponse(t *testing.T) {
 	resp, err := client.Authorize(context.Background(), &AuthorizeRequest{
 		Subject:  Subject{ID: "user-1", Type: "user"},
 		Resource: Resource{ID: "doc-1", Type: "document"},
-		Action:   "read",
+		Action:   Action{Name: "read"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.Allowed {
-		t.Error("expected allowed")
+	if !resp.Decision {
+		t.Error("expected decision=true")
 	}
-	if resp.PolicyID != "pol-123" {
-		t.Errorf("expected pol-123, got %s", resp.PolicyID)
+	if resp.Context == nil {
+		t.Fatal("expected non-nil context")
 	}
-	if resp.AccessPath != "direct" {
-		t.Errorf("expected direct, got %s", resp.AccessPath)
+	if resp.Context.PolicyID != "pol-123" {
+		t.Errorf("expected pol-123, got %s", resp.Context.PolicyID)
+	}
+	if resp.Context.AccessPath != "direct" {
+		t.Errorf("expected direct, got %s", resp.Context.AccessPath)
 	}
 }
 
@@ -122,7 +132,7 @@ func TestAuthorize_AuthError(t *testing.T) {
 	_, err := client.Authorize(context.Background(), &AuthorizeRequest{
 		Subject:  Subject{ID: "user-1"},
 		Resource: Resource{ID: "doc-1"},
-		Action:   "read",
+		Action:   Action{Name: "read"},
 	})
 	if err == nil {
 		t.Fatal("expected error")
@@ -142,7 +152,10 @@ func TestAuthorize_ServerError_Retries(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(AuthorizeResponse{Allowed: true, Reason: "ok"})
+		json.NewEncoder(w).Encode(AuthorizeResponse{
+			Decision: true,
+			Context:  &AuthorizeContext{Reason: "ok"},
+		})
 	})
 	defer srv.Close()
 
@@ -150,13 +163,13 @@ func TestAuthorize_ServerError_Retries(t *testing.T) {
 	resp, err := client.Authorize(context.Background(), &AuthorizeRequest{
 		Subject:  Subject{ID: "user-1"},
 		Resource: Resource{ID: "doc-1"},
-		Action:   "read",
+		Action:   Action{Name: "read"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.Allowed {
-		t.Error("expected allowed after retry")
+	if !resp.Decision {
+		t.Error("expected decision=true after retry")
 	}
 	if attempts != 3 {
 		t.Errorf("expected 3 attempts, got %d", attempts)
@@ -176,7 +189,7 @@ func TestAuthorize_NoRetryOn4xx(t *testing.T) {
 	_, err := client.Authorize(context.Background(), &AuthorizeRequest{
 		Subject:  Subject{ID: "user-1"},
 		Resource: Resource{ID: "doc-1"},
-		Action:   "read",
+		Action:   Action{Name: "read"},
 	})
 	if err == nil {
 		t.Fatal("expected error")
@@ -256,7 +269,10 @@ func TestOAuth_TokenExchangeHappyPath(t *testing.T) {
 				t.Errorf("expected Bearer jwt.token.here, got %s", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(AuthorizeResponse{Allowed: true, Reason: "ok"})
+			json.NewEncoder(w).Encode(AuthorizeResponse{
+				Decision: true,
+				Context:  &AuthorizeContext{Reason: "ok"},
+			})
 		},
 	)
 	defer srv.Close()
@@ -320,7 +336,10 @@ func TestOAuth_CachedTokenReusedAcrossCalls(t *testing.T) {
 		},
 		func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(AuthorizeResponse{Allowed: true, Reason: "ok"})
+			json.NewEncoder(w).Encode(AuthorizeResponse{
+				Decision: true,
+				Context:  &AuthorizeContext{Reason: "ok"},
+			})
 		},
 	)
 	defer srv.Close()
@@ -365,7 +384,10 @@ func TestOAuth_401TriggersRefreshAndRetry(t *testing.T) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(AuthorizeResponse{Allowed: true, Reason: "ok"})
+			json.NewEncoder(w).Encode(AuthorizeResponse{
+				Decision: true,
+				Context:  &AuthorizeContext{Reason: "ok"},
+			})
 		},
 	)
 	defer srv.Close()
@@ -430,7 +452,7 @@ func TestOAuth_ConstructionError_BothAuthModes(t *testing.T) {
 	// public signature stable), so the error surfaces on the first call.
 	c := NewClient("azx_key", WithOAuth("cid", "azx_cs_secret"))
 	_, err := c.Authorize(context.Background(), &AuthorizeRequest{
-		Subject: Subject{ID: "u-1"}, Resource: Resource{ID: "d-1"}, Action: "read",
+		Subject: Subject{ID: "u-1"}, Resource: Resource{ID: "d-1"}, Action: Action{Name: "read"},
 	})
 	if err == nil {
 		t.Fatal("expected validation error when both apiKey and OAuth set")

@@ -26,10 +26,16 @@ func main() {
 	resp, err := client.Authorize(ctx, &authzx.AuthorizeRequest{
 		Subject:  authzx.Subject{ID: "user-123"},
 		Resource: authzx.Resource{ID: "doc-456"},
-		Action:   "read",
+		Action:   authzx.Action{Name: "read"},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Allowed=%v Reason=%q Path=%s\n", resp.Allowed, resp.Reason, resp.AccessPath)
+	reason := ""
+	accessPath := ""
+	if resp.Context != nil {
+		reason = resp.Context.Reason
+		accessPath = resp.Context.AccessPath
+	}
+	fmt.Printf("Decision=%v Reason=%q Path=%s\n", resp.Decision, reason, accessPath)
 }

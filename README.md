@@ -71,10 +71,10 @@ client := authzx.NewClient("", authzx.WithBaseURL("http://localhost:8181"))
 resp, err := client.Authorize(ctx, &authzx.AuthorizeRequest{
     Subject:  authzx.Subject{ID: "user:123", Type: "user"},
     Resource: authzx.Resource{Type: "document", ID: "doc:456"},
-    Action:   "read",
+    Action:   authzx.Action{Name: "read"},
     Context:  map[string]interface{}{"ip": "10.0.0.1"},
 })
-// resp.Allowed, resp.Reason, resp.PolicyID, resp.AccessPath
+// resp.Decision (bool), resp.Context.Reason, resp.Context.PolicyID, resp.Context.AccessPath
 ```
 
 ### net/http Middleware
@@ -142,9 +142,10 @@ The SDK automatically retries on 5xx and 429 responses (default: 2 retries with 
 
 | Type | Fields |
 |------|--------|
-| `Subject` | `ID`, `Type`, `Attributes`, `Roles` |
-| `Resource` | `Type`, `ID`, `Attributes` |
+| `Subject` | `ID`, `Type`, `Attributes`, `Properties`, `Roles` |
+| `Resource` | `Type`, `ID`, `Attributes`, `Properties` |
 | `AuthorizeRequest` | `Subject`, `Resource`, `Action`, `Context` |
-| `AuthorizeResponse` | `Allowed`, `Reason`, `PolicyID`, `AccessPath` |
+| `AuthorizeResponse` | `Decision`, `Context *AuthorizeContext` |
+| `AuthorizeContext` | `Reason`, `ReasonCode`, `PolicyID`, `AccessPath` |
 | `Error` | `StatusCode`, `Message` |
 | `OAuthError` | `StatusCode`, `Code`, `Description` |

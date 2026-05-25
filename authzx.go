@@ -114,16 +114,17 @@ func (c *Client) validateAuth() error {
 }
 
 // Check is a convenience method that returns just the boolean result.
+// It accepts action as a plain string for ergonomics and wraps it into an Action object internally.
 func (c *Client) Check(ctx context.Context, subject Subject, action string, resource Resource) (bool, error) {
 	resp, err := c.Authorize(ctx, &AuthorizeRequest{
 		Subject:  subject,
 		Resource: resource,
-		Action:   action,
+		Action:   Action{Name: action},
 	})
 	if err != nil {
 		return false, err
 	}
-	return resp.Allowed, nil
+	return resp.Decision, nil
 }
 
 func (c *Client) url() string {
@@ -131,6 +132,13 @@ func (c *Client) url() string {
 		return c.baseURL + "/authorize"
 	}
 	return c.baseURL + "/v1/authorize"
+}
+
+func (c *Client) batchURL() string {
+	if len(c.baseURL) >= 3 && c.baseURL[len(c.baseURL)-3:] == "/v1" {
+		return c.baseURL[:len(c.baseURL)-3] + "/access/v1/evaluations"
+	}
+	return c.baseURL + "/access/v1/evaluations"
 }
 
 // authHeader resolves the value for the Authorization header on API calls.
@@ -226,4 +234,95 @@ func (c *Client) Authorize(ctx context.Context, req *AuthorizeRequest) (*Authori
 	}
 
 	return nil, lastErr
+}
+
+// AuthorizeBatch sends a batch evaluation request (AuthZEN 1.0) and returns
+// detailed responses for each evaluation item.
+func (c *Client) AuthorizeBatch(ctx context.Context, req *BatchEvaluationRequest) (*BatchEvaluationResponse, error) {
+	if err := c.validateAuth(); err != nil {
+		return nil, err
+	}
+	if len(req.Evaluations) == 0 {
+		return nil, fmt.Errorf("authzx: batch request requires at least one evaluation")
+	}
+	if len(req.Evaluations) > 50 {
+		return nil, fmt.Errorf("authzx: batch request exceeds maximum of 50 evaluations")
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("authzx: failed to marshal request: %w", err)
+	}
+
+	oauthRetried := false
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*100) * time.Millisecond)
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.batchURL(), bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("authzx: failed to create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		authVal, err := c.authHeader(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if authVal != "" {
+			httpReq.Header.Set("Authorization", authVal)
+		}
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("authzx: request failed: %w", err)
+			continue
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("authzx: failed to read response: %w", err)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			var result BatchEvaluationResponse
+			if err := json.Unmarshal(respBody, &result); err != nil {
+				return nil, fmt.Errorf("authzx: failed to parse response: %w", err)
+			}
+			return &result, nil
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized && c.oauth != nil && !oauthRetried {
+			c.oauth.invalidate()
+			oauthRetried = true
+			attempt--
+			continue
+		}
+
+		apiErr := &Error{StatusCode: resp.StatusCode, Message: string(respBody)}
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			lastErr = apiErr
+			continue
+		}
+		return nil, apiErr
+	}
+
+	return nil, lastErr
+}
+
+// CheckBatch is a convenience method that returns just the boolean decisions.
+func (c *Client) CheckBatch(ctx context.Context, req *BatchEvaluationRequest) ([]bool, error) {
+	resp, err := c.AuthorizeBatch(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]bool, len(resp.Evaluations))
+	for i, eval := range resp.Evaluations {
+		results[i] = eval.Decision
+	}
+	return results, nil
 }

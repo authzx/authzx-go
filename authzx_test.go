@@ -20,8 +20,8 @@ func TestCheck_Allowed(t *testing.T) {
 		if r.Method != "POST" {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if r.URL.Path != "/v1/authorize" {
-			t.Errorf("expected /v1/authorize, got %s", r.URL.Path)
+		if r.URL.Path != "/access/v1/evaluation" {
+			t.Errorf("expected /access/v1/evaluation, got %s", r.URL.Path)
 		}
 		if r.Header.Get("Authorization") != "Bearer test-key" {
 			t.Errorf("expected Bearer test-key, got %s", r.Header.Get("Authorization"))

@@ -128,16 +128,10 @@ func (c *Client) Check(ctx context.Context, subject Subject, action string, reso
 }
 
 func (c *Client) url() string {
-	if len(c.baseURL) >= 3 && c.baseURL[len(c.baseURL)-3:] == "/v1" {
-		return c.baseURL + "/authorize"
-	}
-	return c.baseURL + "/v1/authorize"
+	return c.baseURL + "/access/v1/evaluation"
 }
 
 func (c *Client) batchURL() string {
-	if len(c.baseURL) >= 3 && c.baseURL[len(c.baseURL)-3:] == "/v1" {
-		return c.baseURL[:len(c.baseURL)-3] + "/access/v1/evaluations"
-	}
 	return c.baseURL + "/access/v1/evaluations"
 }
 
